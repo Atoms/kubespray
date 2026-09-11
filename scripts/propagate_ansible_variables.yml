@@ -5,11 +5,11 @@
   connection: local
   gather_facts: false
   vars:
-    fallback_ip: 'bypass tasks in kubespray-defaults'
+    fallback_ip: 'bypass tasks in kubespray_defaults'
   roles:
-  - kubespray-defaults
+  - kubespray_defaults
   tasks:
-  - name: Include versions not in kubespray-defaults
+  - name: Include versions not in kubespray_defaults
     include_vars: "{{ item }}"
     loop:
     - ../roles/container-engine/docker/defaults/main.yml
@@ -20,6 +20,12 @@
       marker: '<!-- {mark} ANSIBLE MANAGED BLOCK -->'
       block: "\n{{ lookup('ansible.builtin.template', 'readme_versions.md.j2') }}\n\n"
       path: ../README.md
+  - name: Render minimum Kubernetes version in README.md
+    lineinfile:
+      path: ../README.md
+      regexp: '^- \*\*Minimum required version of Kubernetes is v.*\*\*$'
+      line: "- **Minimum required version of Kubernetes is v{{ kube_version_min_required }}**"
+      insertafter: '^## Requirements$'
   - name: Render Dockerfiles
     template:
       src: "{{ item }}.j2"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # After a new version of Kubernetes has been released,
-# run this script to update roles/kubespray-defaults/defaults/main/download.yml
+# run this script to update roles/kubespray_defaults/defaults/main/download.yml
 # with new hashes.
 
 import sys
@@ -25,7 +25,7 @@ from typing import Optional, Any
 
 from . import components
 
-CHECKSUMS_YML = Path("roles/kubespray-defaults/defaults/main/checksums.yml")
+CHECKSUMS_YML = Path("roles/kubespray_defaults/vars/main/checksums.yml")
 
 logger = logging.getLogger(__name__)
 
@@ -47,17 +47,13 @@ arch_alt_name = {
     "arm64": "aarch64",
     "ppc64le": None,
     "arm": None,
+    "no_arch": None,
 }
 
 # TODO: downloads not supported
-# gvisor: sha512 checksums
 # helm_archive: PGP signatures
-# krew_archive: different yaml structure (in our download)
-# calico_crds_archive: different yaml structure (in our download)
 
 # TODO:
-# noarch support -> k8s manifests, helm charts
-# different checksum format (needs download role changes)
 # different verification methods (gpg, cosign) ( needs download role changes) (or verify the sig in this script and only use the checksum in the playbook)
 # perf improvements (async)
 
@@ -130,15 +126,20 @@ def download_hash(downloads: {str: {str: Any}}) -> None:
     releases, tags = map(
         dict, partition(lambda r: r[1].get("tags", False), downloads.items())
     )
-    repos = {
-        "with_releases": [r["graphql_id"] for r in releases.values()],
-        "with_tags": [t["graphql_id"] for t in tags.values()],
-    }
+    unique_release_ids = list(dict.fromkeys(
+        r["graphql_id"] for r in releases.values()
+    ))
+    unique_tag_ids = list(dict.fromkeys(
+        t["graphql_id"] for t in tags.values()
+    ))
     response = s.post(
         "https://api.github.com/graphql",
         json={
             "query": files(__package__).joinpath("list_releases.graphql").read_text(),
-            "variables": repos,
+            "variables": {
+                "with_releases": unique_release_ids,
+                "with_tags": unique_tag_ids,
+            },
         },
         headers={
             "Authorization": f"Bearer {os.environ['API_KEY']}",
@@ -159,31 +160,30 @@ def download_hash(downloads: {str: {str: Any}}) -> None:
         except InvalidVersion:
             return None
 
-    repos = response.json()["data"]
-    github_versions = dict(
-        zip(
-            chain(releases.keys(), tags.keys()),
-            [
-                {
-                    v
-                    for r in repo["releases"]["nodes"]
-                    if not r["isPrerelease"]
-                    and (v := valid_version(r["tagName"])) is not None
-                }
-                for repo in repos["with_releases"]
-            ]
-            + [
-                {
-                    v
-                    for t in repo["refs"]["nodes"]
-                    if (v := valid_version(t["name"].removeprefix("release-")))
-                    is not None
-                }
-                for repo in repos["with_tags"]
-            ],
-            strict=True,
-        )
-    )
+    resp_data = response.json()["data"]
+    release_versions_by_id = {
+        gql_id: {
+            v
+            for r in repo["releases"]["nodes"]
+            if not r["isPrerelease"]
+            and (v := valid_version(r["tagName"])) is not None
+        }
+        for gql_id, repo in zip(unique_release_ids, resp_data["with_releases"])
+    }
+    tag_versions_by_id = {
+        gql_id: {
+            v
+            for t in repo["refs"]["nodes"]
+            if (v := valid_version(t["name"].removeprefix("release-")))
+            is not None
+        }
+        for gql_id, repo in zip(unique_tag_ids, resp_data["with_tags"])
+    }
+    github_versions = {}
+    for name, info in releases.items():
+        github_versions[name] = release_versions_by_id[info["graphql_id"]]
+    for name, info in tags.items():
+        github_versions[name] = tag_versions_by_id[info["graphql_id"]]
 
     components_supported_arch = {
         component.removesuffix("_checksums"): [a for a in archs.keys()]
@@ -250,13 +250,30 @@ def download_hash(downloads: {str: {str: Any}}) -> None:
                 ).hexdigest()
             return hash_file.content.decode().split()[0]
 
+    skipped_404 = set()
+    fetched = set()
     for component, versions in chain(new_versions.items(), hash_set_to_0.items()):
         c = component + "_checksums"
         for arch in components_supported_arch[component]:
             for version in versions:
-                data[c][arch][
-                    str(version)
-                ] = f"{downloads[component].get('hashtype', 'sha256')}:{get_hash(component, version, arch)}"
+                # Some releases are published without binary artifacts
+                try:
+                    data[c][arch][
+                        str(version)
+                    ] = f"{downloads[component].get('hashtype', 'sha256')}:{get_hash(component, version, arch)}"
+                    fetched.add(component)
+                except requests.exceptions.HTTPError as e:
+                    if e.response is not None and e.response.status_code == 404:
+                        logger.warning(
+                            "Skipping %s %s (%s): release asset not found (404) at %s",
+                            component,
+                            version,
+                            arch,
+                            e.response.url,
+                        )
+                        skipped_404.add(component)
+                        continue
+                    raise
 
         data[c] = {
             arch: {
@@ -267,6 +284,15 @@ def download_hash(downloads: {str: {str: Any}}) -> None:
             }
             for arch, versions in data[c].items()
         }
+
+    # Only 404s for a component means its release layout probably changed
+    all_missing = sorted(skipped_404 - fetched)
+    if all_missing:
+        logger.error(
+            "All hash fetches returned 404 for: %s",
+            ", ".join(all_missing),
+        )
+        sys.exit(1)
 
     with open(checksums_file, "w") as checksums_yml:
         yaml.dump(data, checksums_yml)
